@@ -16,12 +16,19 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"github.com/briandowns/spinner"
+	"github.com/fatih/color"
 	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+	"unsafe"
 
 	"github.com/google/log4jscanner/jar"
 )
@@ -53,20 +60,124 @@ var skipDirs = map[string]bool{
 	// TODO(ericchiang): expand
 }
 
+var (
+	errUnknownDriveType = errors.New("unknown drive type")
+	errNoRootDir        = errors.New("invalid root drive path")
+
+	driveTypeErrors = [...]error{
+		0: errUnknownDriveType,
+		1: errNoRootDir,
+	}
+	kernel32          = syscall.NewLazyDLL("kernel32.dll")
+	getDriveTypeWProc = kernel32.NewProc("GetDriveTypeW")
+	getLastError      = kernel32.NewProc("GetLastError")
+)
+
+const (
+	driveUnknown = iota
+	driveNoRootDir
+
+	driveRemovable
+	driveFixed
+	driveRemote
+	driveCDROM
+	driveRamdisk
+)
+
+func getdrives() ([]string, error) {
+	var drive = [4]uint16{
+		1: ':',
+		2: '\\',
+	}
+	var drives []string
+
+	getLogicalDrivesHandle := kernel32.NewProc("GetLogicalDrives")
+
+	if ret, _, _ := getLogicalDrivesHandle.Call(0, 0, 0, 0); ret == 0 {
+		errorVal, _, _ := getLastError.Call()
+		return nil, fmt.Errorf("GetLogicalDrives failed with return code %d", errorVal)
+	} else {
+		driveLetters := bitsToDrives(uint32(ret))
+		for _, driveLetter := range driveLetters {
+			//fmt.Printf("Process drive letter '%s'\n", driveLetter)
+			drive[0] = uint16(driveLetter[0])
+			dt, err := getDriveType(drive[:])
+
+			if err != nil {
+				if err == errNoRootDir {
+					continue
+				}
+				return nil, fmt.Errorf("error getting type of: %s: %s",
+					syscall.UTF16ToString(drive[:]), err)
+			}
+			if dt != driveFixed {
+				continue
+			}
+			drives = append(drives, syscall.UTF16ToString(drive[:]))
+		}
+	}
+	return drives, nil
+}
+
+func getDriveType(rootPathName []uint16) (int, error) {
+	rc, _, _ := getDriveTypeWProc.Call(
+		uintptr(unsafe.Pointer(&rootPathName[0])),
+	)
+
+	dt := int(rc)
+
+	if dt == driveUnknown || dt == driveNoRootDir {
+		return -1, driveTypeErrors[dt]
+	}
+
+	return dt, nil
+}
+
+func bitsToDrives(bitMap uint32) (drives []string) {
+	availableDrives := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"}
+
+	for i := range availableDrives {
+		if bitMap&1 == 1 {
+			drives = append(drives, availableDrives[i])
+		}
+		bitMap >>= 1
+	}
+
+	return
+}
+
+func removeDuplicateStr(strSlice []string) []string {
+	allKeys := make(map[string]bool)
+	list := []string{}
+	for _, item := range strSlice {
+		if _, value := allKeys[item]; !value {
+			allKeys[item] = true
+			list = append(list, item)
+		}
+	}
+	return list
+}
+
 func main() {
 	var (
-		rewrite bool
-		w       bool
-		verbose bool
-		v       bool
-		force   bool
-		f       bool
-		toSkip  []string
+		rewrite    bool
+		w          bool
+		verbose    bool
+		v          bool
+		force      bool
+		f          bool
+		toSkip     []string
+		foundFiles []string
 	)
 	appendSkip := func(dir string) error {
 		toSkip = append(toSkip, dir)
 		return nil
 	}
+
+	foundVulnerableFile := false
+	fmt.Println()
+	headColor := color.New(color.FgGreen).Add(color.Underline)
+	headColor.Println("  *** ENEXSA Log4J Patcher ***  ")
 
 	flag.BoolVar(&rewrite, "rewrite", false, "")
 	flag.BoolVar(&w, "w", false, "")
@@ -80,8 +191,12 @@ func main() {
 	flag.Parse()
 	dirs := flag.Args()
 	if len(dirs) == 0 {
-		usage()
-		os.Exit(1)
+		drives, err := getdrives()
+		if err != nil {
+			color.Red(err.Error())
+			os.Exit(1)
+		}
+		dirs = drives
 	}
 	if f {
 		force = f
@@ -98,7 +213,16 @@ func main() {
 			log.Printf(format, v...)
 		}
 	}
+	fmt.Println("Searching for Log4J vulnerability at:")
+	for _, dir := range dirs {
+		fmt.Printf(" -> %s\n", dir)
+	}
+	fmt.Println()
 	seen := 0
+	s := spinner.New(spinner.CharSets[14], 100*time.Millisecond) // Build our new spinner
+	s.Color("white", "bold")
+	s.Suffix = " Searching..."
+	s.Start()
 	walker := jar.Walker{
 		Rewrite: rewrite,
 		SkipDir: func(path string, d fs.DirEntry) bool {
@@ -124,11 +248,12 @@ func main() {
 			return ignore
 		},
 		HandleError: func(path string, err error) {
-			log.Printf("Error: scanning %s: %v", path, err)
+			color.Yellow("Error: scanning %s: %v", path, err)
 		},
 		HandleReport: func(path string, r *jar.Report) {
 			if !rewrite {
-				fmt.Println(path)
+				foundVulnerableFile = true
+				foundFiles = append(foundFiles, path)
 			}
 		},
 		HandleRewrite: func(path string, r *jar.Report) {
@@ -143,5 +268,50 @@ func main() {
 		if err := walker.Walk(dir); err != nil {
 			log.Printf("Error: walking %s: %v", dir, err)
 		}
+	}
+
+	s.Stop()
+	if foundVulnerableFile {
+		var char string
+		fmt.Println()
+		fmt.Println("-------------------------------------")
+
+		color.Yellow("Found files with vulnerability: ")
+		var searchDirs []string
+		for _, dir := range foundFiles {
+			fmt.Println(dir)
+			searchDirs = append(searchDirs, filepath.Dir(dir))
+		}
+		fmt.Println("-------------------------------------")
+
+		searchDirs = removeDuplicateStr(searchDirs)
+		//for _, dir := range searchDirs {
+		//	fmt.Println(dir)
+		//}
+
+		fmt.Print("Do you want to fix found files? [y/n]")
+		fmt.Scanln(&char)
+		char = strings.Replace(char, "\r\n", "", -1)
+		if strings.Compare("y", char) == 0 {
+			fmt.Println()
+			color.Green("Fixing found files...")
+			s.Suffix = " Fixing..."
+			s.Start()
+			rewrite = true
+			walker.Rewrite = true
+
+			for _, dir := range dirs {
+				logf("Scanning %s", dir)
+				if err := walker.Walk(dir); err != nil {
+					log.Printf("Error: walking %s: %v", dir, err)
+				}
+			}
+			s.Stop()
+			color.Green("Finished")
+		} else {
+			color.Yellow("Fixing cancelled!")
+		}
+	} else {
+		color.Green("No vulnerable files found.")
 	}
 }
