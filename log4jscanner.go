@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"github.com/briandowns/spinner"
 	"github.com/fatih/color"
+	svc2 "golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/mgr"
 	"io/fs"
 	"log"
 	"os"
@@ -158,6 +160,148 @@ func removeDuplicateStr(strSlice []string) []string {
 	return list
 }
 
+func stopServices(serviceInfos []ServiceInfo) error {
+	if serviceInfos == nil {
+		return nil
+	}
+	manager, err := mgr.Connect()
+	if err != nil {
+		return fmt.Errorf("Cannot connect to manager %v", err)
+	}
+	maxRuns := 120
+	defer manager.Disconnect()
+	for _, serviceInfo := range serviceInfos {
+		if !serviceInfo.restart {
+			continue
+		}
+		fmt.Printf("Stopping service %s.", serviceInfo.displayName)
+		service, err := manager.OpenService(serviceInfo.serviceName)
+		if err != nil {
+			return fmt.Errorf("service %s does not exist: %v", serviceInfo.displayName, err)
+		}
+		status, err := service.Control(svc2.Stop)
+		i := 0
+		for status.State != svc2.Stopped && i < maxRuns {
+			time.Sleep(1 * time.Second)
+			status, err = service.Query()
+			fmt.Print(".")
+			i = i + 1
+		}
+		service.Close()
+		if i < maxRuns {
+			color.Green(" [DONE]")
+			fmt.Println()
+		} else {
+			color.Red(" [FAILED]")
+			fmt.Println()
+			fmt.Println("Please try to stop the service manually")
+		}
+
+	}
+	return nil
+}
+
+func startServices(serviceInfos []ServiceInfo) error {
+	if serviceInfos == nil {
+		return nil
+	}
+	manager, err := mgr.Connect()
+	if err != nil {
+		return fmt.Errorf("Cannot connect to manager %v", err)
+	}
+	maxRuns := 120
+	defer manager.Disconnect()
+	for _, serviceInfo := range serviceInfos {
+		if !serviceInfo.restart {
+			continue
+		}
+		fmt.Printf("Starting service %s.", serviceInfo.displayName)
+		service, err := manager.OpenService(serviceInfo.serviceName)
+		if err != nil {
+			return fmt.Errorf("service %s does not exist: %v", serviceInfo.serviceName, err)
+		}
+		err = service.Start()
+		i := 0
+		status, err := service.Query()
+		for status.State != svc2.Running && i < maxRuns {
+			time.Sleep(1 * time.Second)
+			status, err = service.Query()
+			fmt.Print(".")
+			i = i + 1
+		}
+		service.Close()
+		if i < maxRuns {
+			color.Green(" [DONE]")
+			fmt.Println()
+		} else {
+			color.Red(" [FAILED]")
+			fmt.Println()
+			fmt.Println("Please try to start the service manually")
+		}
+	}
+	return nil
+}
+
+type ServiceIdentifier struct {
+	serviceName    string
+	directoryNames []string
+}
+
+type ServiceInfo struct {
+	serviceName string
+	displayName string
+	restart     bool
+}
+
+func createRestartServiceList(paths []string) ([]ServiceInfo, error) {
+	var serviceNames []ServiceInfo
+	identifiers := []ServiceIdentifier{
+		//{
+		//	serviceName:    "enexsa-cluster-agent",
+		//	directoryNames: []string{"elasticsearch"},
+		//},
+		{
+			serviceName:    "PCNS1",
+			directoryNames: []string{"powerchute"},
+		},
+	}
+	manager, err := mgr.Connect()
+	if err != nil {
+		return nil, fmt.Errorf("Cannot connect to manager %v", err)
+	}
+	defer manager.Disconnect()
+
+	for _, id := range identifiers {
+		found := false
+		for _, dirName := range id.directoryNames {
+			for _, p := range paths {
+				if strings.Contains(strings.ToLower(p), strings.ToLower(dirName)) {
+
+					service, err := manager.OpenService(id.serviceName)
+					if err != nil {
+						found = true
+						break
+					}
+					cfg, err := service.Config()
+					state, err := service.Query()
+
+					serviceNames = append(serviceNames, ServiceInfo{
+						serviceName: id.serviceName,
+						displayName: cfg.DisplayName,
+						restart:     state.State == svc2.Running,
+					})
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+	}
+	return serviceNames, nil
+}
+
 func main() {
 	var (
 		rewrite    bool
@@ -177,7 +321,7 @@ func main() {
 	foundVulnerableFile := false
 	fmt.Println()
 	headColor := color.New(color.FgGreen).Add(color.Underline)
-	headColor.Println("  *** ENEXSA Log4J Patcher ***  ")
+	headColor.Println("  *** Log4J Patcher provided by ENEXSA ***  ")
 
 	flag.BoolVar(&rewrite, "rewrite", false, "")
 	flag.BoolVar(&w, "w", false, "")
@@ -219,7 +363,7 @@ func main() {
 	}
 	fmt.Println()
 	seen := 0
-	s := spinner.New(spinner.CharSets[14], 100*time.Millisecond) // Build our new spinner
+	s := spinner.New(spinner.CharSets[9], 100*time.Millisecond) // Build our new spinner
 	s.Color("white", "bold")
 	s.Suffix = " Searching..."
 	s.Start()
@@ -242,13 +386,15 @@ func main() {
 				return true
 			}
 			ignore, err := ignoreDir(path, force)
-			if err != nil {
+			if err != nil && verbose {
 				log.Printf("Error scanning %s: %v", path, err)
 			}
 			return ignore
 		},
 		HandleError: func(path string, err error) {
-			color.Yellow("Error: scanning %s: %v", path, err)
+			if verbose {
+				color.Yellow("Error: scanning %s: %v", path, err)
+			}
 		},
 		HandleReport: func(path string, r *jar.Report) {
 			if !rewrite {
@@ -273,6 +419,7 @@ func main() {
 	s.Stop()
 	if foundVulnerableFile {
 		var char string
+
 		fmt.Println()
 		fmt.Println("-------------------------------------")
 
@@ -282,6 +429,18 @@ func main() {
 			fmt.Println(dir)
 			searchDirs = append(searchDirs, filepath.Dir(dir))
 		}
+		services, err := createRestartServiceList(searchDirs)
+		if err != nil {
+			color.Red("Could not check for services to be restarted after fix. Maybe you have to reboot after the fix")
+		} else {
+			fmt.Println()
+			fmt.Println("The following services will be restarted: ")
+			for _, svc := range services {
+				if svc.restart {
+					fmt.Printf(" * %s\n", svc.displayName)
+				}
+			}
+		}
 		fmt.Println("-------------------------------------")
 
 		searchDirs = removeDuplicateStr(searchDirs)
@@ -289,10 +448,12 @@ func main() {
 		//	fmt.Println(dir)
 		//}
 
-		fmt.Print("Do you want to fix found files? [y/n]")
+		fmt.Print("Do you want to fix found files? [y/n + Hit enter] ")
 		fmt.Scanln(&char)
 		char = strings.Replace(char, "\r\n", "", -1)
 		if strings.Compare("y", char) == 0 {
+
+			stopServices(services)
 			fmt.Println()
 			color.Green("Fixing found files...")
 			s.Suffix = " Fixing..."
@@ -308,10 +469,13 @@ func main() {
 			}
 			s.Stop()
 			color.Green("Finished")
+			startServices(services)
 		} else {
 			color.Yellow("Fixing cancelled!")
 		}
 	} else {
 		color.Green("No vulnerable files found.")
 	}
+	fmt.Println("Press enter to exit")
+	fmt.Scanln()
 }
